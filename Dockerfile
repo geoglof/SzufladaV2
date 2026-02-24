@@ -17,7 +17,7 @@
 #   mqtt_bridge (ONE MQTT connection) <-> all other nodes via ROS2 topics
 
 # 1. Base image: ROS2 Jazzy
-FROM ros:jazzy-ros-base
+FROM docker.io/library/ros:jazzy-ros-base
 
 # 2. Install ROS2 packages + Python dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
