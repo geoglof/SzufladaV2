@@ -1,0 +1,354 @@
+/*
+  MERGE: message.txt + kod_esp.txt
+  - Ethernet W5500 + MQTT + HC-SR04 + LED
+  - Sterowanie silnikami LEDC (ESP32 core 3.x)
+  - Enkodery KWADRATUROWE (A/B) z kierunkiem (+/-) i poprawnymi deltami
+  - Watchdog komend (bezpieczne zatrzymanie gdy brak MQTT)
+  - Opcjonalna mikro-korekcja "jedź prosto", gdy L~R
+
+  UWAGA HW:
+  GPIO 34-39 (typowo używane na enkodery) są input-only i nie mają software pull-up/down.
+  Zadbaj o zewnętrzne rezystory pull-up/pull-down lub sygnał z enkodera z driverem.
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <Ethernet.h>
+#include <PubSubClient.h>
+
+// -------------------- W5500 --------------------
+#define ETH_CS   5
+#define ETH_RST  21
+
+// -------------------- HC-SR04 --------------------
+const int trigPin = 32;
+const int echoPin = 33;
+
+// -------------------- LED --------------------
+const int ledPin = 2;
+
+// -------------------- MAPOWANIE: czy motor1 jest lewym? --------------------
+const bool motor1IsLeft = false;
+
+// -------------------- Silniki (jak w kod_esp.txt) --------------------
+const uint8_t m1_RPWM = 25;  // Forward
+const uint8_t m1_LPWM = 26;  // Reverse
+const uint8_t m1_EN   = 27;  // Enable
+
+const uint8_t m2_RPWM = 12;  // Forward
+const uint8_t m2_LPWM = 13;  // Reverse
+const uint8_t m2_EN   = 14;  // Enable
+
+// -------------------- Enkodery KWADRATUROWE (A/B) --------------------
+// (jak w message.txt: m1: 35/34, m2: 36/39)
+const uint8_t m1_encA = 35;
+const uint8_t m1_encB = 34;
+const uint8_t m2_encA = 36;
+const uint8_t m2_encB = 39;
+
+// Zmapowane piny na LEWE i PRAWE koło
+uint8_t pinL_RPWM, pinL_LPWM, pinL_EN, pinL_encA, pinL_encB;
+uint8_t pinR_RPWM, pinR_LPWM, pinR_EN, pinR_encA, pinR_encB;
+
+// Liczniki enkoderów (ze znakiem: + przód, - tył)
+volatile long encL_count = 0;
+volatile long encR_count = 0;
+
+// -------------------- PWM (LEDC) --------------------
+const int pwmFreq = 5000;
+const int pwmResolution = 8; // 0-255
+
+// -------------------- Network --------------------
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 1, 50);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress mqtt_server(192, 168, 1, 1);
+
+const int mqtt_port = 1883;
+
+// MQTT topics (jak w kod_esp.txt + 1 nowy opcjonalny)
+const char* topic_distance    = "sensor/distance";
+const char* topic_led         = "sensor/led";
+const char* topic_motor_left  = "motor/left";
+const char* topic_motor_right = "motor/right";
+const char* topic_encoder     = "sensor/encoder";
+const char* topic_sync        = "motor/sync";   // "ON"/"OFF" (opcjonalnie)
+
+EthernetClient ethClient;
+PubSubClient client(ethClient);
+
+// -------------------- Sterowanie ruchem --------------------
+volatile int targetLeft  = 0;   // -255..255
+volatile int targetRight = 0;   // -255..255
+
+unsigned long lastCmdMs = 0;
+const unsigned long CMD_TIMEOUT_MS = 1200; // po tylu ms bez komend zatrzymaj
+
+bool syncEnabled = true;        // korekcja tylko gdy L~R
+const float SYNC_KP = 0.5f;     // jak w message.txt (skalowane na delta/okres)
+const int   SYNC_LIMIT = 40;    // limit korekty (±)
+
+// Harmonogramy
+const unsigned long DIST_MS = 100;
+const unsigned long ENC_PUB_MS = 200;
+const unsigned long CTRL_MS = 20;
+
+// Snapshoty do delt
+long lastEncL_pub = 0;
+long lastEncR_pub = 0;
+unsigned long lastEncPubMs = 0;
+
+long lastEncL_ctrl = 0;
+long lastEncR_ctrl = 0;
+unsigned long lastCtrlMs = 0;
+
+unsigned long lastDistanceMs = 0;
+
+// -------------------- ISR: enkoder kwadraturowy --------------------
+// Logika jak w message.txt: jeśli B != A -> +, inaczej -
+void IRAM_ATTR isrEncL() {
+  if (digitalRead(pinL_encB) != digitalRead(pinL_encA)) encL_count++;
+  else encL_count--;
+}
+
+void IRAM_ATTR isrEncR() {
+  if (digitalRead(pinR_encB) != digitalRead(pinR_encA)) encR_count++;
+  else encR_count--;
+}
+
+// -------------------- Utils --------------------
+static inline long atomicReadLong(volatile long &v) {
+  noInterrupts();
+  long x = v;
+  interrupts();
+  return x;
+}
+
+void applyMotor(uint8_t rpwm, uint8_t lpwm, int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    ledcWrite(rpwm, (uint32_t)speed);
+    ledcWrite(lpwm, 0);
+  } else if (speed < 0) {
+    ledcWrite(rpwm, 0);
+    ledcWrite(lpwm, (uint32_t)(-speed));
+  } else {
+    ledcWrite(rpwm, 0);
+    ledcWrite(lpwm, 0);
+  }
+}
+
+void setLeftMotor(int speed)  { applyMotor(pinL_RPWM, pinL_LPWM, speed); }
+void setRightMotor(int speed) { applyMotor(pinR_RPWM, pinR_LPWM, speed); }
+
+float readDistanceMeters() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000); // us, timeout 30ms
+  // dystans [m] = duration[us] * 343[m/s] / 2 / 1e6 = duration * 343 / 2e6
+  return (float)duration * 343.0f / 2000000.0f;
+}
+
+// -------------------- MQTT --------------------
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  static char msg[64];
+  if (length >= sizeof(msg)) length = sizeof(msg) - 1;
+  memcpy(msg, payload, length);
+  msg[length] = '\0';
+
+  // LED
+  if (strcmp(topic, topic_led) == 0) {
+    if (strcmp(msg, "ON") == 0)  digitalWrite(ledPin, HIGH);
+    if (strcmp(msg, "OFF") == 0) digitalWrite(ledPin, LOW);
+    return;
+  }
+
+  // Tryb sync
+  if (strcmp(topic, topic_sync) == 0) {
+    if (strcmp(msg, "ON") == 0)  syncEnabled = true;
+    if (strcmp(msg, "OFF") == 0) syncEnabled = false;
+    return;
+  }
+
+  // Silniki
+  if (strcmp(topic, topic_motor_left) == 0) {
+    int sp = atoi(msg);
+    sp = constrain(sp, -255, 255);
+    targetLeft = sp;
+    lastCmdMs = millis();
+    return;
+  }
+
+  if (strcmp(topic, topic_motor_right) == 0) {
+    int sp = atoi(msg);
+    sp = constrain(sp, -255, 255);
+    targetRight = sp;
+    lastCmdMs = millis();
+    return;
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect("ESP32_Rover")) {
+      client.subscribe(topic_led);
+      client.subscribe(topic_motor_left);
+      client.subscribe(topic_motor_right);
+      client.subscribe(topic_sync);
+    } else {
+      delay(800);
+    }
+  }
+}
+
+// -------------------- SETUP --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Mapowanie lewo/prawo
+  if (motor1IsLeft) {
+    pinL_RPWM = m1_RPWM; pinL_LPWM = m1_LPWM; pinL_EN = m1_EN; pinL_encA = m1_encA; pinL_encB = m1_encB;
+    pinR_RPWM = m2_RPWM; pinR_LPWM = m2_LPWM; pinR_EN = m2_EN; pinR_encA = m2_encA; pinR_encB = m2_encB;
+  } else {
+    pinL_RPWM = m2_RPWM; pinL_LPWM = m2_LPWM; pinL_EN = m2_EN; pinL_encA = m2_encA; pinL_encB = m2_encB;
+    pinR_RPWM = m1_RPWM; pinR_LPWM = m1_LPWM; pinR_EN = m1_EN; pinR_encA = m1_encA; pinR_encB = m1_encB;
+  }
+
+  // HC-SR04 + LED
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Enable silników
+  pinMode(pinL_EN, OUTPUT);
+  pinMode(pinR_EN, OUTPUT);
+  digitalWrite(pinL_EN, HIGH);
+  digitalWrite(pinR_EN, HIGH);
+
+  // PWM LEDC (ESP32 core 3.x)
+  ledcAttach(pinL_RPWM, pwmFreq, pwmResolution);
+  ledcAttach(pinL_LPWM, pwmFreq, pwmResolution);
+  ledcAttach(pinR_RPWM, pwmFreq, pwmResolution);
+  ledcAttach(pinR_LPWM, pwmFreq, pwmResolution);
+
+  setLeftMotor(0);
+  setRightMotor(0);
+
+  // Enkodery: input-only piny 34-39 => ustaw INPUT (pullup i tak nie zadziała programowo)
+  pinMode(pinL_encA, INPUT);
+  pinMode(pinL_encB, INPUT);
+  pinMode(pinR_encA, INPUT);
+  pinMode(pinR_encB, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(pinL_encA), isrEncL, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinR_encA), isrEncR, CHANGE);
+
+  // W5500 reset
+  pinMode(ETH_RST, OUTPUT);
+  digitalWrite(ETH_RST, LOW);
+  delay(100);
+  digitalWrite(ETH_RST, HIGH);
+  delay(150);
+
+  Ethernet.init(ETH_CS);
+  Ethernet.begin(mac, ip, gateway, gateway, subnet);
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqtt_callback);
+
+  lastCmdMs = millis();
+  lastCtrlMs = millis();
+  lastDistanceMs = millis();
+  lastEncPubMs = millis();
+}
+
+// -------------------- LOOP --------------------
+void loop() {
+  Ethernet.maintain();
+
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  unsigned long now = millis();
+
+  // 1) Dystans
+  if (now - lastDistanceMs >= DIST_MS) {
+    lastDistanceMs = now;
+
+    float distance = readDistanceMeters();
+    char distStr[16];
+    dtostrf(distance, 4, 3, distStr);
+    client.publish(topic_distance, distStr);
+  }
+
+  // 2) Publikacja enkoderów (total + delta)
+  if (now - lastEncPubMs >= ENC_PUB_MS) {
+    lastEncPubMs = now;
+
+    long encL = atomicReadLong(encL_count);
+    long encR = atomicReadLong(encR_count);
+
+    long dL = encL - lastEncL_pub;
+    long dR = encR - lastEncR_pub;
+
+    lastEncL_pub = encL;
+    lastEncR_pub = encR;
+
+    char encStr[64];
+    // Format: L_total,R_total,L_delta,R_delta
+    snprintf(encStr, sizeof(encStr), "%ld,%ld,%ld,%ld", encL, encR, dL, dR);
+    client.publish(topic_encoder, encStr);
+  }
+
+  // 3) Sterowanie silnikami (z watchdog + opcjonalna mikro-korekcja)
+  if (now - lastCtrlMs >= CTRL_MS) {
+    lastCtrlMs = now;
+
+    int cmdL = targetLeft;
+    int cmdR = targetRight;
+
+    // Watchdog: brak komend => stop
+    if (now - lastCmdMs > CMD_TIMEOUT_MS) {
+      cmdL = 0;
+      cmdR = 0;
+    }
+
+    // Korekcja tylko gdy jedziemy "prosto" (L ~ R i ten sam znak)
+    long encL = atomicReadLong(encL_count);
+    long encR = atomicReadLong(encR_count);
+
+    long vL = encL - lastEncL_ctrl;   // "prędkość" w impulsach na CTRL_MS
+    long vR = encR - lastEncR_ctrl;
+
+    lastEncL_ctrl = encL;
+    lastEncR_ctrl = encR;
+
+    int outL = cmdL;
+    int outR = cmdR;
+
+    const bool approxStraight = (abs(cmdL - cmdR) <= 5) && (cmdL != 0) && (cmdR != 0) && ((cmdL > 0) == (cmdR > 0));
+
+    if (syncEnabled && approxStraight) {
+      long error = vL - vR; // dodatni => lewe szybsze niż prawe
+      int corr = (int)(error * SYNC_KP);
+      corr = constrain(corr, -SYNC_LIMIT, SYNC_LIMIT);
+
+      // rozdziel korekcję, żeby utrzymać mniej więcej średnią
+      outL = cmdL - corr / 2;
+      outR = cmdR + corr / 2;
+    }
+
+    outL = constrain(outL, -255, 255);
+    outR = constrain(outR, -255, 255);
+
+    setLeftMotor(outL);
+    setRightMotor(outR);
+  }
+}

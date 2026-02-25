@@ -6,6 +6,9 @@ computes wheel odometry using differential drive kinematics.
 
 This node has ZERO MQTT dependency.
 
+The ESP32 sends SIGNED quadrature encoder deltas (+ forward, - reverse),
+so no direction inference from cmd_vel is needed.
+
 Noise filtering:
     - When motors are stopped (cmd_vel = 0), encoder ticks are IGNORED
       because the encoders pick up EMI noise from the motor driver.
@@ -17,8 +20,8 @@ Publishes:
     - TF: odom -> base_link
 
 Subscribes:
-    - /encoder_raw (std_msgs/String) -- format: "enc1_total,enc2_total,enc1_delta,enc2_delta"
-    - /cmd_vel (geometry_msgs/Twist) -- to infer wheel direction (encoders are direction-blind)
+    - /encoder_raw (std_msgs/String) -- format: "L_total,R_total,L_delta,R_delta" (signed)
+    - /cmd_vel (geometry_msgs/Twist) -- only to detect if motors are active (noise filter)
 """
 
 import math
@@ -42,17 +45,16 @@ def quaternion_from_yaw(yaw):
 
 
 class OdometryNode(Node):
-    """Computes and publishes odometry from encoder data (pure ROS2)."""
+    """Computes and publishes odometry from signed encoder data (pure ROS2)."""
 
     def __init__(self):
         super().__init__('odometry_node')
 
         # Declare parameters (calibrate with real measurements)
-        self.declare_parameter('wheel_diameter', 0.065)
-        self.declare_parameter('wheel_base', 0.20)
-        self.declare_parameter('encoder_ticks_per_rev_left', 33500)
-        self.declare_parameter('encoder_ticks_per_rev_right', 153000)
-        self.declare_parameter('motor_inversion', True)
+        self.declare_parameter('wheel_diameter', 0.06)
+        self.declare_parameter('wheel_base', 0.40)
+        self.declare_parameter('encoder_ticks_per_rev_left', 200)
+        self.declare_parameter('encoder_ticks_per_rev_right', 200)
         self.declare_parameter('min_delta_ticks', 3)
         self.declare_parameter('stop_grace_sec', 0.4)
 
@@ -65,8 +67,6 @@ class OdometryNode(Node):
             'encoder_ticks_per_rev_left').get_parameter_value().integer_value
         self.ticks_per_rev_right = self.get_parameter(
             'encoder_ticks_per_rev_right').get_parameter_value().integer_value
-        self.motor_inversion = self.get_parameter(
-            'motor_inversion').get_parameter_value().bool_value
         self.min_delta_ticks = self.get_parameter(
             'min_delta_ticks').get_parameter_value().integer_value
         self.stop_grace_sec = self.get_parameter(
@@ -87,10 +87,6 @@ class OdometryNode(Node):
         self.theta = 0.0
         self.last_time = self.get_clock().now()
 
-        # Direction tracking (from cmd_vel)
-        self.left_direction = 1.0
-        self.right_direction = 1.0
-
         # Motor state tracking -- filter noise when stopped
         self.motors_active = False
         self.last_nonzero_cmd_time = self.get_clock().now()
@@ -101,7 +97,7 @@ class OdometryNode(Node):
         self.encoder_debug_pub = self.create_publisher(String, 'encoder', 10)
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # Subscribe to cmd_vel to infer direction
+        # Subscribe to cmd_vel ONLY for noise filtering (not direction)
         self.create_subscription(Twist, 'cmd_vel', self._cmd_vel_callback, 10)
 
         # Subscribe to encoder data from mqtt_bridge
@@ -109,7 +105,7 @@ class OdometryNode(Node):
             String, 'encoder_raw', self._encoder_callback, 50)
 
         self.get_logger().info(
-            f'Odometry node ready (no MQTT). '
+            f'Odometry node ready (quadrature encoders, signed deltas). '
             f'wheel_d={self.wheel_diameter}m, base={self.wheel_base}m, '
             f'ticks/rev L={self.ticks_per_rev_left} R={self.ticks_per_rev_right}, '
             f'noise filter: min_delta={self.min_delta_ticks} ticks, '
@@ -117,26 +113,18 @@ class OdometryNode(Node):
         )
 
     def _cmd_vel_callback(self, msg):
-        """Track motor direction and activity from cmd_vel."""
-        v_left = msg.linear.x - msg.angular.z * (self.wheel_base / 2.0)
-        v_right = msg.linear.x + msg.angular.z * (self.wheel_base / 2.0)
-
-        self.left_direction = 1.0 if v_left >= 0.0 else -1.0
-        self.right_direction = 1.0 if v_right >= 0.0 else -1.0
-
-        # Track whether motors are being commanded to move
+        """Track whether motors are active (for noise filtering only)."""
         if abs(msg.linear.x) > 0.001 or abs(msg.angular.z) > 0.001:
             self.motors_active = True
             self.last_nonzero_cmd_time = self.get_clock().now()
         else:
-            # Allow a short grace period for the wheels to actually stop
             elapsed = (self.get_clock().now() -
                        self.last_nonzero_cmd_time).nanoseconds / 1e9
             if elapsed > self.stop_grace_sec:
                 self.motors_active = False
 
     def _encoder_callback(self, msg):
-        """Process encoder data from mqtt_bridge."""
+        """Process signed encoder data from mqtt_bridge."""
         try:
             data = msg.data.strip()
 
@@ -145,47 +133,37 @@ class OdometryNode(Node):
             debug_msg.data = data
             self.encoder_debug_pub.publish(debug_msg)
 
-            # Parse: "enc1_total,enc2_total,enc1_delta,enc2_delta"
+            # Parse: "L_total,R_total,L_delta,R_delta" (all signed)
             parts = data.split(',')
             if len(parts) != 4:
                 return
 
-            delta_left = abs(int(parts[2]))
-            delta_right = abs(int(parts[3]))
+            # Signed deltas from quadrature encoders (+ forward, - reverse)
+            delta_left = int(parts[2])
+            delta_right = int(parts[3])
 
             # ── NOISE FILTER ────────────────────────────────────────
-            # When motors are stopped, encoder ticks are EMI noise.
-            # Also filter tiny deltas even while driving.
             if not self.motors_active:
-                if delta_left > 0 or delta_right > 0:
+                if delta_left != 0 or delta_right != 0:
                     self.noise_filtered_count += 1
                     if self.noise_filtered_count % 25 == 1:
                         self.get_logger().info(
                             f'Noise filtered: L={delta_left} R={delta_right} '
                             f'(motors stopped, {self.noise_filtered_count} '
                             f'total filtered)')
-                # Still publish odom (same position) to keep TF alive
                 delta_left = 0
                 delta_right = 0
             else:
-                # While driving, apply deadzone for small noise spikes
-                if delta_left < self.min_delta_ticks:
+                # Deadzone: ignore tiny deltas (noise while driving)
+                if abs(delta_left) < self.min_delta_ticks:
                     delta_left = 0
-                if delta_right < self.min_delta_ticks:
+                if abs(delta_right) < self.min_delta_ticks:
                     delta_right = 0
                 self.noise_filtered_count = 0
 
-            # Apply direction (inferred from last cmd_vel)
-            if self.motor_inversion:
-                d_left = delta_left * self.meters_per_tick_left * (
-                    -self.left_direction)
-                d_right = delta_right * self.meters_per_tick_right * (
-                    -self.right_direction)
-            else:
-                d_left = delta_left * self.meters_per_tick_left * (
-                    self.left_direction)
-                d_right = delta_right * self.meters_per_tick_right * (
-                    self.right_direction)
+            # Convert ticks to meters (sign already correct from ESP32)
+            d_left = delta_left * self.meters_per_tick_left
+            d_right = delta_right * self.meters_per_tick_right
 
             # Differential drive odometry
             d_center = (d_left + d_right) / 2.0
