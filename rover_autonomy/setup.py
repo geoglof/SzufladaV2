@@ -46,6 +46,9 @@ setup(
             'wall_follower = rover_autonomy.wall_follower:main',
             'visual_tracker = rover_autonomy.visual_tracker:main',
             'move_distance = rover_autonomy.move_distance:main',
+            # --- Tools ---
+            'encoder_calibration = rover_autonomy.encoder_calibration:main',
+            'odom_monitor = rover_autonomy.odom_monitor:main',
         ],
     },
 )

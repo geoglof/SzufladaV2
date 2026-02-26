@@ -59,28 +59,27 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'max_pwm': 255,
+            'min_pwm': 60,
             'max_linear_speed': 0.3,
-            'wheel_base': 0.40,
-            'motor_inversion': True,
+            'wheel_base': 0.264,
+            'motor_inversion': False,
             'timeout_sec': 0.5,
             'right_trim': 1.0,
         }]
     )
 
     # ── odometry_node: encoders -> /odom + TF (no MQTT) ────────────
-    # ESP32 now sends signed quadrature encoder deltas, no motor_inversion needed.
-    # ticks_per_rev values will need recalibration with the new quadrature encoders
-    # (expect roughly 2x the old values since CHANGE triggers on both edges).
+    # Calibrated: 437 ticks/rev on both wheels, wheel diameter 0.05m
     odometry = Node(
         package='rover_autonomy',
         executable='odometry_node',
         name='odometry_node',
         output='screen',
         parameters=[{
-            'wheel_diameter': 0.06,
-            'wheel_base': 0.40,
-            'encoder_ticks_per_rev_left': 200,
-            'encoder_ticks_per_rev_right': 200,
+            'wheel_diameter': 0.065,
+            'wheel_base': 0.264,
+            'encoder_ticks_per_rev_left': 437,
+            'encoder_ticks_per_rev_right': 437,
         }]
     )
 

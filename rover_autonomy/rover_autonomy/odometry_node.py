@@ -51,10 +51,10 @@ class OdometryNode(Node):
         super().__init__('odometry_node')
 
         # Declare parameters (calibrate with real measurements)
-        self.declare_parameter('wheel_diameter', 0.06)
-        self.declare_parameter('wheel_base', 0.40)
-        self.declare_parameter('encoder_ticks_per_rev_left', 200)
-        self.declare_parameter('encoder_ticks_per_rev_right', 200)
+        self.declare_parameter('wheel_diameter', 0.065)
+        self.declare_parameter('wheel_base', 0.264)
+        self.declare_parameter('encoder_ticks_per_rev_left', 437)
+        self.declare_parameter('encoder_ticks_per_rev_right', 437)
         self.declare_parameter('min_delta_ticks', 3)
         self.declare_parameter('stop_grace_sec', 0.4)
 
